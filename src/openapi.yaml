@@ -1,0 +1,1703 @@
+openapi: 3.0.3
+info:
+  title: Justip Multi-Platform API
+  description: |
+    REST API Contract for the Jastip Application system as specified in the PRD (Jastip App.md).
+    Serves both the Go Backend (`justip_be`), Shopper Web CMS (`justip_cms`), and Buyer Mobile Client.
+    
+    ### Architecture Highlights:
+    - **Standard Response Envelope**: Consistent `{ success, message, data, meta }` and error formats.
+    - **Role-Based Access Control**: `BUYER`, `SHOPPER`, `ADMIN`.
+    - **Order State Machine**: Strict transitions: `PENDING` -> `PAID` -> `PURCHASED` -> `SHIPPED`.
+    - **Payment Gateway (QRIS)**: Dynamic QRIS generator with auto-reconciliation via webhook signature.
+    - **Asynchronous Notifications**: Pub-Sub triggers when new kloter batches are published.
+    - **Export Engine**: CSV/Excel automated reporting for Shoppers.
+  version: 1.0.0
+  contact:
+    name: Fajar Trengginas
+    email: dev@justip.local
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Development Server (Golang Gin/Fiber)
+  - url: https://staging-api.justip.com/api/v1
+    description: Staging Environment
+  - url: https://api.justip.com/api/v1
+    description: Production Environment
+
+tags:
+  - name: Auth & SSO
+    description: Authentication, Registration, and Google SSO endpoints
+  - name: Shopper Profile & Subscriptions
+    description: Shopper discovery and Buyer notification subscription engine (Pub-Sub)
+  - name: Kloter (Batches)
+    description: Batch creation, timeline discovery, and quota management
+  - name: Catalog
+    description: Default trip catalog management by Shoppers
+  - name: Orders & State Machine
+    description: Order placement, atomic quota deduction, and status transitions
+  - name: Payments & QRIS Webhook
+    description: Dynamic QRIS code generation and payment gateway webhook
+  - name: Reporting & Export
+    description: Transaction recaps and CSV/Excel export
+
+paths:
+  # ==========================================
+  # AUTHENTICATION
+  # ==========================================
+  /auth/register:
+    post:
+      tags:
+        - Auth & SSO
+      summary: Register a new user (Buyer or Shopper)
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /auth/login:
+    post:
+      tags:
+        - Auth & SSO
+      summary: Login with email and password
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /auth/sso/google:
+    post:
+      tags:
+        - Auth & SSO
+      summary: Sign in or register with Google SSO
+      operationId: googleSSOLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - id_token
+              properties:
+                id_token:
+                  type: string
+                  description: Google OAuth ID token
+                  example: eyJhbGciOiJSUzI1NiIsImtpZCI6...
+      responses:
+        '200':
+          description: Google SSO successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /auth/me:
+    get:
+      tags:
+        - Auth & SSO
+      summary: Get currently authenticated user profile
+      operationId: getCurrentUser
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: User profile details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # ==========================================
+  # SHOPPER PROFILE & SUBSCRIPTIONS
+  # ==========================================
+  /shoppers:
+    get:
+      tags:
+        - Shopper Profile & Subscriptions
+      summary: List verified shoppers
+      operationId: listShoppers
+      parameters:
+        - name: query
+          in: query
+          description: Search by name or username
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: List of shoppers
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ShopperPublicProfile'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+
+  /shoppers/{shopper_id}/subscribe:
+    post:
+      tags:
+        - Shopper Profile & Subscriptions
+      summary: Subscribe to Shopper's kloter open notifications (Pub-Sub)
+      operationId: subscribeShopper
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: shopper_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: shp-01
+      responses:
+        '200':
+          description: Subscribed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+    delete:
+      tags:
+        - Shopper Profile & Subscriptions
+      summary: Unsubscribe from Shopper's notifications
+      operationId: unsubscribeShopper
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: shopper_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: shp-01
+      responses:
+        '200':
+          description: Unsubscribed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardResponse'
+
+  # ==========================================
+  # KLOTER (BATCHES)
+  # ==========================================
+  /kloters:
+    get:
+      tags:
+        - Kloter (Batches)
+      summary: Explore active Open Jastip kloters (Buyer Timeline & Feed)
+      operationId: listKloters
+      parameters:
+        - name: destination
+          in: query
+          description: Filter by country or city (e.g. Tokyo, Bangkok)
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Kloter status filter
+          schema:
+            $ref: '#/components/schemas/KloterStatus'
+            default: OPEN
+        - name: search
+          in: query
+          description: Search term in title or shopper name
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Paginated list of kloters
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/KloterSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+
+  /kloters/{id}:
+    get:
+      tags:
+        - Kloter (Batches)
+      summary: Get detailed kloter batch info with rules and catalog items
+      operationId: getKloterDetail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: KLT-TYO-01
+      responses:
+        '200':
+          description: Kloter detail with catalog
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/KloterDetail'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /shopper/kloters:
+    post:
+      tags:
+        - Kloter (Batches)
+      summary: Create new Jastip Batch (Publishes kloter & triggers Pub-Sub push notifications)
+      operationId: createKloterBatch
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateKloterRequest'
+      responses:
+        '201':
+          description: Kloter created and notification event published
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/KloterDetail'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+
+  /shopper/kloters/{id}:
+    patch:
+      tags:
+        - Kloter (Batches)
+      summary: Update kloter details or change lifecycle status
+      operationId: updateKloter
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateKloterRequest'
+      responses:
+        '200':
+          description: Kloter updated successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/KloterDetail'
+
+  # ==========================================
+  # CATALOG MANAGEMENT
+  # ==========================================
+  /kloters/{kloter_id}/catalog:
+    get:
+      tags:
+        - Catalog
+      summary: Get default catalog items for a kloter
+      operationId: getKloterCatalog
+      parameters:
+        - name: kloter_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of catalog items
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CatalogItem'
+
+    post:
+      tags:
+        - Catalog
+      summary: Add item to kloter catalog (Shopper only)
+      operationId: addCatalogItem
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: kloter_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCatalogItemRequest'
+      responses:
+        '201':
+          description: Catalog item created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CatalogItem'
+
+  /shopper/kloters/{kloter_id}/catalog/{item_id}:
+    delete:
+      tags:
+        - Catalog
+      summary: Remove item from catalog
+      operationId: deleteCatalogItem
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: kloter_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Item removed from catalog
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardResponse'
+
+  # ==========================================
+  # ORDERS & STATE MACHINE ENGINE
+  # ==========================================
+  /orders:
+    post:
+      tags:
+        - Orders & State Machine
+      summary: Checkout / Create Order (Catalog item and/or Custom Request with photo)
+      description: |
+        Atomically checks remaining kloter quota slots.
+        If slots are available, creates order with state `PENDING` and decrements remaining quota.
+      operationId: createOrder
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created successfully, awaiting payment
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/OrderDetail'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '422':
+          description: Kloter quota exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                success: false
+                message: Kuota kloter sudah penuh
+                error:
+                  code: KLOTER_QUOTA_EXCEEDED
+                  details: []
+
+  /buyer/orders:
+    get:
+      tags:
+        - Orders & State Machine
+      summary: Get Buyer's own orders history
+      operationId: getBuyerOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Paginated buyer orders
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OrderSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+
+  /orders/{id}:
+    get:
+      tags:
+        - Orders & State Machine
+      summary: Get detailed order status and live tracking history (State Machine)
+      operationId: getOrderDetail
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: ORD-202610-001
+      responses:
+        '200':
+          description: Order detail with tracking timeline
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/OrderDetail'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /shopper/orders:
+    get:
+      tags:
+        - Orders & State Machine
+      summary: Get incoming orders for Shopper Web CMS (filterable by kloter and status)
+      operationId: getShopperOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: kloter_id
+          in: query
+          description: Filter by specific kloter batch
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: search
+          in: query
+          description: Search buyer name, item, or order ID
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of orders for Shopper dashboard
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OrderDetail'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+
+  /shopper/orders/{id}/status:
+    patch:
+      tags:
+        - Orders & State Machine
+      summary: Update single order state machine status (e.g. PURCHASED, SHIPPED)
+      operationId: updateOrderStatus
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+      responses:
+        '200':
+          description: Order status updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/OrderDetail'
+        '400':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /shopper/orders/bulk-status:
+    post:
+      tags:
+        - Orders & State Machine
+      summary: Bulk update order statuses (Shopper CMS mass action)
+      operationId: bulkUpdateOrderStatus
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkUpdateOrderStatusRequest'
+      responses:
+        '200':
+          description: Bulk status update completed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          updated_count:
+                            type: integer
+                            example: 12
+                          failed_ids:
+                            type: array
+                            items:
+                              type: string
+
+  # ==========================================
+  # PAYMENTS & QRIS WEBHOOK
+  # ==========================================
+  /orders/{id}/payment/qris:
+    post:
+      tags:
+        - Payments & QRIS Webhook
+      summary: Generate dynamic QRIS code for order
+      operationId: generateQRISPayment
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payment_type:
+                  type: string
+                  enum: [FULL, DP_50]
+                  default: FULL
+      responses:
+        '200':
+          description: QRIS generated with countdown timer
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/QRISPaymentData'
+
+  /webhooks/payment/qris:
+    post:
+      tags:
+        - Payments & QRIS Webhook
+      summary: Webhook callback from Payment Gateway (Midtrans/Xendit)
+      description: |
+        Receives instant payment notifications. Validates HMAC signature.
+        Automatically shifts order state from `PENDING` to `PAID` without manual mutation check.
+      operationId: handleQRISWebhook
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: HMAC SHA-256 signature for verification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentGatewayWebhookPayload'
+      responses:
+        '200':
+          description: Webhook received and processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                    example: true
+        '401':
+          description: Invalid signature
+        '404':
+          description: Order not found
+
+  # ==========================================
+  # REPORTING & EXPORT
+  # ==========================================
+  /shopper/reports/summary:
+    get:
+      tags:
+        - Reporting & Export
+      summary: Get Shopper financial & operational statistics
+      operationId: getShopperSummaryReport
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: kloter_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Financial metrics and stats
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StandardResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ShopperFinancialSummary'
+
+  /shopper/reports/orders/export:
+    get:
+      tags:
+        - Reporting & Export
+      summary: Export order recap in CSV format for Shopper
+      operationId: exportOrdersCSV
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: kloter_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, xlsx]
+            default: csv
+      responses:
+        '200':
+          description: CSV file stream
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+
+# ==========================================
+# COMPONENTS & SCHEMAS
+# ==========================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    UnauthorizedError:
+      description: Missing, invalid, or expired JWT token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: Token autentikasi tidak valid atau telah kedaluwarsa
+            error:
+              code: UNAUTHORIZED
+              details: []
+
+    ForbiddenError:
+      description: User lacks sufficient role privileges
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: Anda tidak memiliki akses untuk aksi ini
+            error:
+              code: FORBIDDEN
+              details: []
+
+    NotFoundError:
+      description: Requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: Sumber daya tidak ditemukan
+            error:
+              code: RESOURCE_NOT_FOUND
+              details: []
+
+    ValidationError:
+      description: Request payload failed schema or business validations
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: Validasi gagal
+            error:
+              code: VALIDATION_ERROR
+              details:
+                - field: quota_max
+                  issue: Nilai kuota maksimal harus minimal 1
+
+    ConflictError:
+      description: Resource already exists (e.g. email or username taken)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    # -----------------
+    # ENUMS
+    # -----------------
+    UserRole:
+      type: string
+      enum: [BUYER, SHOPPER, ADMIN]
+      example: BUYER
+
+    OrderStatus:
+      type: string
+      enum: [PENDING, PAID, PURCHASED, SHIPPED, CANCELLED]
+      description: |
+        Order State Machine:
+        - `PENDING`: Order created, waiting for QRIS payment
+        - `PAID`: Payment verified automatically via Webhook
+        - `PURCHASED`: Shopper has physically bought the items at store
+        - `SHIPPED`: Items handed over to shipping courier with tracking number
+        - `CANCELLED`: Expired or cancelled order
+      example: PAID
+
+    KloterStatus:
+      type: string
+      enum: [OPEN, CLOSED, SHOPPING, COMPLETED]
+      example: OPEN
+
+    OrderType:
+      type: string
+      enum: [CATALOG, CUSTOM, MIXED]
+      example: CATALOG
+
+    # -----------------
+    # STANDARD ENVELOPES
+    # -----------------
+    StandardResponse:
+      type: object
+      required:
+        - success
+        - message
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: Operasi berhasil dijalankan
+
+    ErrorResponse:
+      type: object
+      required:
+        - success
+        - message
+        - error
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: Pesanan gagal diproses
+        error:
+          type: object
+          required:
+            - code
+          properties:
+            code:
+              type: string
+              example: ORDER_INVALID_STATE_TRANSITION
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                    example: status
+                  issue:
+                    type: string
+                    example: Status tidak dapat berpindah dari PENDING langsung ke SHIPPED
+
+    PaginationMeta:
+      type: object
+      required:
+        - page
+        - limit
+        - total
+        - total_pages
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 10
+        total:
+          type: integer
+          example: 45
+        total_pages:
+          type: integer
+          example: 5
+
+    # -----------------
+    # AUTH SCHEMAS
+    # -----------------
+    RegisterRequest:
+      type: object
+      required:
+        - name
+        - email
+        - password
+        - phone
+        - role
+      properties:
+        name:
+          type: string
+          example: Sarah Wijaya
+        email:
+          type: string
+          format: email
+          example: sarah@justip.local
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: SecretPassword123!
+        phone:
+          type: string
+          example: '081234567890'
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: sarah@justip.local
+        password:
+          type: string
+          format: password
+          example: SecretPassword123!
+
+    AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/StandardResponse'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - token
+                - token_type
+                - expires_in
+                - user
+              properties:
+                token:
+                  type: string
+                  example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                token_type:
+                  type: string
+                  example: Bearer
+                expires_in:
+                  type: integer
+                  description: Expiration in seconds
+                  example: 86400
+                user:
+                  $ref: '#/components/schemas/UserProfile'
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - name
+        - email
+        - role
+      properties:
+        id:
+          type: string
+          example: usr-89210
+        name:
+          type: string
+          example: Sarah Wijaya
+        email:
+          type: string
+          example: sarah@justip.local
+        phone:
+          type: string
+          example: '081234567890'
+        role:
+          $ref: '#/components/schemas/UserRole'
+        avatar_url:
+          type: string
+          example: https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150
+        kyc_verified:
+          type: boolean
+          example: true
+
+    # -----------------
+    # SHOPPER PROFILE
+    # -----------------
+    ShopperPublicProfile:
+      type: object
+      required:
+        - id
+        - name
+        - rating
+        - reviews_count
+        - subscribers_count
+        - is_subscribed
+      properties:
+        id:
+          type: string
+          example: shp-01
+        name:
+          type: string
+          example: Sarah Wijaya
+        username:
+          type: string
+          example: '@sarah.travels'
+        avatar_url:
+          type: string
+          example: https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150
+        verified:
+          type: boolean
+          example: true
+        rating:
+          type: number
+          format: float
+          example: 4.9
+        reviews_count:
+          type: integer
+          example: 142
+        subscribers_count:
+          type: integer
+          example: 840
+        is_subscribed:
+          type: boolean
+          example: false
+        bio:
+          type: string
+          example: Spesialis jastip Tokyo & Osaka. Handcarry only!
+
+    # -----------------
+    # KLOTER SCHEMAS
+    # -----------------
+    KloterSummary:
+      type: object
+      required:
+        - id
+        - title
+        - destination
+        - flag
+        - shopper_name
+        - start_date
+        - end_date
+        - quota_max
+        - quota_used
+        - status
+      properties:
+        id:
+          type: string
+          example: KLT-TYO-01
+        title:
+          type: string
+          example: Kloter Tokyo - Autumn Special 🍁
+        destination:
+          type: string
+          example: Tokyo, Japan
+        flag:
+          type: string
+          example: '🇯🇵'
+        shopper_id:
+          type: string
+          example: shp-01
+        shopper_name:
+          type: string
+          example: Sarah Wijaya
+        shopper_avatar:
+          type: string
+          example: https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150
+        start_date:
+          type: string
+          format: date
+          example: '2026-10-15'
+        end_date:
+          type: string
+          format: date
+          example: '2026-10-20'
+        order_deadline:
+          type: string
+          example: '2026-10-14 23:59'
+        quota_max:
+          type: integer
+          example: 20
+        quota_used:
+          type: integer
+          example: 12
+        quota_remaining:
+          type: integer
+          example: 8
+        status:
+          $ref: '#/components/schemas/KloterStatus'
+        popular_catalog:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogItem'
+
+    KloterDetail:
+      allOf:
+        - $ref: '#/components/schemas/KloterSummary'
+        - type: object
+          properties:
+            rules:
+              type: array
+              items:
+                type: string
+              example:
+                - Maksimal berat barang titipan per pesanan 2 kg
+                - Tidak menerima barang pecah belah besar
+                - Wajib menyertakan foto jelas untuk custom request
+            catalog:
+              type: array
+              items:
+                $ref: '#/components/schemas/CatalogItem'
+
+    CreateKloterRequest:
+      type: object
+      required:
+        - title
+        - destination
+        - flag
+        - start_date
+        - end_date
+        - order_deadline
+        - quota_max
+      properties:
+        title:
+          type: string
+          example: Kloter Tokyo - Autumn Special 🍁
+        destination:
+          type: string
+          example: Tokyo, Japan
+        flag:
+          type: string
+          example: '🇯🇵'
+        start_date:
+          type: string
+          format: date
+          example: '2026-11-01'
+        end_date:
+          type: string
+          format: date
+          example: '2026-11-06'
+        order_deadline:
+          type: string
+          example: '2026-10-31 23:59'
+        quota_max:
+          type: integer
+          minimum: 1
+          example: 25
+        rules:
+          type: array
+          items:
+            type: string
+          example:
+            - Maksimal berat 2kg
+            - Dilarang cairan >100ml di kabin
+
+    UpdateKloterRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        status:
+          $ref: '#/components/schemas/KloterStatus'
+        quota_max:
+          type: integer
+        order_deadline:
+          type: string
+
+    # -----------------
+    # CATALOG SCHEMAS
+    # -----------------
+    CatalogItem:
+      type: object
+      required:
+        - id
+        - name
+        - price
+        - fee
+      properties:
+        id:
+          type: string
+          example: cat-1
+        name:
+          type: string
+          example: Tokyo Banana (Original 8 pcs)
+        category:
+          type: string
+          example: Snack
+        price:
+          type: integer
+          description: Base item price in IDR
+          example: 245000
+        fee:
+          type: integer
+          description: Shopper handling/jastip fee in IDR
+          example: 35000
+        image_url:
+          type: string
+          example: https://images.unsplash.com/photo-1582293041079-7814c2f12063?w=300
+        description:
+          type: string
+          example: Bolu pisang khas Tokyo Station, expiry aman.
+
+    CreateCatalogItemRequest:
+      type: object
+      required:
+        - name
+        - price
+        - fee
+      properties:
+        name:
+          type: string
+          example: Royce Chocolate Bitter
+        category:
+          type: string
+          example: Snack
+        price:
+          type: integer
+          example: 150000
+        fee:
+          type: integer
+          example: 30000
+        image_url:
+          type: string
+          example: https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=300
+        description:
+          type: string
+          example: Cokelat khas Hokkaido, handcarry dingin.
+
+    # -----------------
+    # ORDER SCHEMAS
+    # -----------------
+    OrderItem:
+      type: object
+      required:
+        - name
+        - qty
+        - price
+        - fee
+      properties:
+        catalog_id:
+          type: string
+          nullable: true
+          example: cat-1
+        name:
+          type: string
+          example: Tokyo Banana (Original 8 pcs)
+        qty:
+          type: integer
+          minimum: 1
+          example: 2
+        price:
+          type: integer
+          example: 245000
+        fee:
+          type: integer
+          example: 35000
+
+    OrderHistoryEvent:
+      type: object
+      required:
+        - status
+        - timestamp
+        - note
+      properties:
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        timestamp:
+          type: string
+          example: '2026-10-02 10:20'
+        note:
+          type: string
+          example: Pembayaran terverifikasi otomatis via QRIS Webhook
+
+    CreateOrderRequest:
+      type: object
+      required:
+        - kloter_id
+        - buyer_name
+        - buyer_phone
+      properties:
+        kloter_id:
+          type: string
+          example: KLT-TYO-01
+        buyer_name:
+          type: string
+          example: Dimas Pratama
+        buyer_phone:
+          type: string
+          example: '081234567890'
+        catalog_items:
+          type: array
+          items:
+            type: object
+            required:
+              - catalog_id
+              - qty
+            properties:
+              catalog_id:
+                type: string
+                example: cat-1
+              qty:
+                type: integer
+                example: 2
+        custom_request:
+          type: object
+          properties:
+            item_name:
+              type: string
+              example: Matcha Ceremony Grade - Marukyu Koyamaen (100g)
+            estimated_price:
+              type: integer
+              example: 320000
+            notes:
+              type: string
+              example: Titip beli di Ippodo Tea Ginza atau Marukyu store.
+            image_url:
+              type: string
+              example: https://images.unsplash.com/photo-1576092768241-dec231879fc3?w=300
+
+    OrderSummary:
+      type: object
+      required:
+        - id
+        - kloter_title
+        - shopper_name
+        - total
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          example: ORD-202610-001
+        kloter_id:
+          type: string
+          example: KLT-TYO-01
+        kloter_title:
+          type: string
+          example: Kloter Tokyo - Autumn Special 🍁
+        shopper_name:
+          type: string
+          example: Sarah Wijaya
+        total:
+          type: integer
+          example: 780000
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        items_count:
+          type: integer
+          example: 3
+        created_at:
+          type: string
+          example: '2026-10-02 10:15'
+
+    OrderDetail:
+      type: object
+      required:
+        - id
+        - kloter_id
+        - kloter_title
+        - shopper_name
+        - buyer_name
+        - buyer_phone
+        - type
+        - items
+        - subtotal
+        - service_fee
+        - app_fee
+        - total
+        - status
+        - created_at
+        - history
+      properties:
+        id:
+          type: string
+          example: ORD-202610-001
+        kloter_id:
+          type: string
+          example: KLT-TYO-01
+        kloter_title:
+          type: string
+          example: Kloter Tokyo - Autumn Special 🍁
+        shopper_name:
+          type: string
+          example: Sarah Wijaya
+        buyer_name:
+          type: string
+          example: Dimas Pratama
+        buyer_phone:
+          type: string
+          example: '081234567890'
+        type:
+          $ref: '#/components/schemas/OrderType'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        custom_notes:
+          type: string
+          example: Tolong cari yang expired minimal 3 minggu setelah kedatangan.
+        custom_image_url:
+          type: string
+          nullable: true
+          example: https://images.unsplash.com/photo-1576092768241-dec231879fc3?w=300
+        subtotal:
+          type: integer
+          example: 675000
+        service_fee:
+          type: integer
+          example: 100000
+        app_fee:
+          type: integer
+          example: 5000
+        total:
+          type: integer
+          example: 780000
+        payment_method:
+          type: string
+          example: QRIS
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        tracking_no:
+          type: string
+          example: JP-ID-8829103
+        created_at:
+          type: string
+          example: '2026-10-02 10:15'
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderHistoryEvent'
+
+    UpdateOrderStatusRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        note:
+          type: string
+          example: Barang sudah dibeli di store Ginza
+        tracking_no:
+          type: string
+          example: JNE-BKK-990184
+
+    BulkUpdateOrderStatusRequest:
+      type: object
+      required:
+        - order_ids
+        - status
+      properties:
+        order_ids:
+          type: array
+          items:
+            type: string
+          example: [ORD-202610-001, ORD-202610-002]
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        note:
+          type: string
+          example: Mass update ke Purchased oleh Shopper
+
+    # -----------------
+    # PAYMENT SCHEMAS
+    # -----------------
+    QRISPaymentData:
+      type: object
+      required:
+        - qris_content
+        - qris_image_url
+        - amount
+        - expires_at
+        - countdown_seconds
+      properties:
+        order_id:
+          type: string
+          example: ORD-202610-001
+        qris_content:
+          type: string
+          description: EMVCo QRIS raw payload string
+          example: 00020101021226600016ID.CO.QRIS.WWW0118936009180000000001...
+        qris_image_url:
+          type: string
+          example: https://api.justip.com/v1/payments/qris/render/ORD-202610-001.png
+        amount:
+          type: integer
+          example: 780000
+        expires_at:
+          type: string
+          format: date-time
+          example: '2026-10-02T10:35:00Z'
+        countdown_seconds:
+          type: integer
+          example: 900
+
+    PaymentGatewayWebhookPayload:
+      type: object
+      required:
+        - transaction_id
+        - order_id
+        - gross_amount
+        - payment_type
+        - transaction_status
+      properties:
+        transaction_id:
+          type: string
+          example: TRX-MID-992019
+        order_id:
+          type: string
+          example: ORD-202610-001
+        gross_amount:
+          type: string
+          example: '780000.00'
+        payment_type:
+          type: string
+          example: qris
+        transaction_status:
+          type: string
+          enum: [settlement, capture, pending, expire, cancel]
+          example: settlement
+        settlement_time:
+          type: string
+          example: '2026-10-02 10:20:15'
+        signature_key:
+          type: string
+          example: 9e3b44b88a91c13d80bf98ecb9...
+
+    # -----------------
+    # FINANCIAL REPORT
+    # -----------------
+    ShopperFinancialSummary:
+      type: object
+      required:
+        - total_orders
+        - total_gmv
+        - total_shopper_fee
+        - completed_orders
+        - pending_purchase
+      properties:
+        total_orders:
+          type: integer
+          example: 48
+        total_gmv:
+          type: integer
+          description: Gross Merchandise Value (IDR)
+          example: 28500000
+        total_shopper_fee:
+          type: integer
+          description: Net Shopper Handling Fee (IDR)
+          example: 4250000
+        completed_orders:
+          type: integer
+          example: 32
+        pending_purchase:
+          type: integer
+          example: 12
+        quota_occupancy_rate:
+          type: number
+          format: float
+          example: 85.5
